@@ -17,6 +17,14 @@ import torch.distributed as dist
 import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+# CONFIGURATION
+
+# (Bruce) Gradient centralization: subtract mean from gradients for >1D params
+USE_GRADIENT_CENTRALIZATION = False
+
+# (Bruce) Weight decay -- standard for NN but not implemented for some reason (?)
+WEIGHT_DECAY = 0.0  
+
 # -----------------------------------------------------------------------------
 # Muon optimizer
 
@@ -318,9 +326,9 @@ class DistributedDataLoader:
 
 @dataclass
 class Hyperparameters:
-    # data hyperparams
-    input_bin : str = 'data/fineweb10B/fineweb_train_*.bin' # input .bin to train on
-    input_val_bin : str = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
+    # data hyperparams (Bruce) -- changed paths -- buggy code
+    input_bin : str = 'fineweb10B/fineweb_train_*.bin' # input .bin to train on 
+    input_val_bin : str = 'fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
     # optimization hyperparams
     batch_size : int = 8*64 # batch size, in sequences, across all devices
     device_batch_size : int = 64 # batch size, in sequences, per device
@@ -329,7 +337,7 @@ class Hyperparameters:
     learning_rate : float = 0.0036
     warmup_iters : int = 0
     warmdown_iters : int = 1450 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
-    weight_decay : float = 0
+    weight_decay : float = WEIGHT_DECAY # (Bruce)
     # evaluation and logging hyperparams
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
@@ -362,6 +370,7 @@ val_loader = DistributedDataLoader(args.input_val_bin, B, T, ddp_rank, ddp_world
 if master_process:
     print(f"Training DataLoader: total number of tokens: {train_loader.ntok_total} across {len(train_loader.files)} files")
     print(f"Validation DataLoader: total number of tokens: {val_loader.ntok_total} across {len(val_loader.files)} files")
+    print(f"Config: gradient_centralization={USE_GRADIENT_CENTRALIZATION}, weight_decay={WEIGHT_DECAY}")
 x, y = train_loader.next_batch()
 
 # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested to me by @Grad62304977.
@@ -494,6 +503,11 @@ for step in range(args.num_iterations + 1):
             loss.backward() # just sync on the last step
     for p in model.parameters():
         p.grad /= train_accumulation_steps
+    #(Bruce)
+    if USE_GRADIENT_CENTRALIZATION:
+        for p in model.parameters():
+            if p.grad is not None and p.grad.dim() > 1:
+                p.grad -= p.grad.mean(dim=tuple(range(1, p.grad.dim())), keepdim=True)
     # step the optimizers and schedulers
     for opt, sched in zip(optimizers, schedulers):
         opt.step()

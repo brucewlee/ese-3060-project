@@ -24,6 +24,17 @@ import torchvision.transforms as T
 
 torch.backends.cudnn.benchmark = True
 
+# CONFIGURATION
+# (Bruce) Cutout augmentation: randomly masks square patches during training
+USE_CUTOUT = False
+CUTOUT_SIZE = 8
+
+# (Bruce) SiLU activation: replaces GELU with SiLU (x * sigmoid(x)) -- SiLU is computationally cheaper than GELU
+USE_SILU = False
+
+# (Bruce) Warmup fraction: fraction of training used for LR warmup
+WARMUP_FRACTION = 0.23 
+
 # We express the main training hyperparameters (batch size, learning rate, momentum, and weight decay)
 # in decoupled form, so that each one can be tuned independently. This accomplishes the following:
 # * Assuming time-constant gradients, the average step size is decoupled from everything but the lr.
@@ -93,6 +104,24 @@ def batch_crop(images, crop_size):
             mask = (shifts[:, 1] == s)
             images_out[mask] = images_tmp[mask, :, :, r+s:r+s+crop_size]
     return images_out
+
+# (Bruce) Cutout
+def batch_cutout(images, cutout_size):
+    # randomly mask a square patch in each image
+    n, c, h, w = images.shape
+
+    # random top-left corner then coordinates
+    y = torch.randint(0, h - cutout_size + 1, (n,), device=images.device)
+    x = torch.randint(0, w - cutout_size + 1, (n,), device=images.device)
+
+    yy = torch.arange(h, device=images.device).view(1, h, 1)
+    xx = torch.arange(w, device=images.device).view(1, 1, w)
+    y = y.view(n, 1, 1)
+    x = x.view(n, 1, 1)
+
+    # create mask
+    mask = (yy >= y) & (yy < y + cutout_size) & (xx >= x) & (xx < x + cutout_size)
+    return images * (~mask.unsqueeze(1))
 
 class CifarLoader:
 
@@ -196,7 +225,8 @@ class ConvGroup(nn.Module):
         self.norm1 = BatchNorm(channels_out, batchnorm_momentum)
         self.conv2 = Conv(channels_out, channels_out)
         self.norm2 = BatchNorm(channels_out, batchnorm_momentum)
-        self.activ = nn.GELU()
+        # (Bruce) use SiLU if enabled
+        self.activ = nn.SiLU() if USE_SILU else nn.GELU()
 
     def forward(self, x):
         x = self.conv1(x)
@@ -217,9 +247,10 @@ def make_net():
     batchnorm_momentum = hyp['net']['batchnorm_momentum']
     whiten_kernel_size = 2
     whiten_width = 2 * 3 * whiten_kernel_size**2
+    activation = nn.SiLU() if USE_SILU else nn.GELU() #(Bruce)
     net = nn.Sequential(
         Conv(3, whiten_width, whiten_kernel_size, padding=0, bias=True),
-        nn.GELU(),
+        activation, #(Bruce)
         ConvGroup(whiten_width,     widths['block1'], batchnorm_momentum),
         ConvGroup(widths['block1'], widths['block2'], batchnorm_momentum),
         ConvGroup(widths['block2'], widths['block3'], batchnorm_momentum),
@@ -380,7 +411,8 @@ def main(run):
     optimizer = torch.optim.SGD(param_configs, momentum=momentum, nesterov=True)
 
     def get_lr(step):
-        warmup_steps = int(total_train_steps * 0.23)
+       # (Bruce) use configurable warmup 
+        warmup_steps = int(total_train_steps * WARMUP_FRACTION)
         warmdown_steps = total_train_steps - warmup_steps
         if step < warmup_steps:
             frac = step / warmup_steps
@@ -418,6 +450,9 @@ def main(run):
 
         model.train()
         for inputs, labels in train_loader:
+            # (Bruce) apply cutout
+            if USE_CUTOUT:
+                inputs = batch_cutout(inputs, CUTOUT_SIZE)
 
             outputs = model(inputs)
             loss = loss_fn(outputs, labels).sum()
